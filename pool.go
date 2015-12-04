@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/smtp"
 	"os"
@@ -45,6 +46,7 @@ type connResp struct {
 }
 
 type Pool struct {
+	Smtps              bool
 	Host               string
 	Port               uint16
 	TLSClientConfig   *tls.Config
@@ -64,7 +66,8 @@ type Pool struct {
 
 	clsd               bool
 
-	net_DialTimeout    func(string, string, time.Duration ) (net.Conn, error)
+	net_DialTimeout    func(string, string, time.Duration) (net.Conn, error)
+	tls_DialTimeout    func(string, string, time.Duration, *tls.Config) (net.Conn, error)
 	net_smtp_NewClient func(net.Conn, string) (smtpClient, error)
 }
 
@@ -214,14 +217,28 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		defer close(ctl)
 		server := fmt.Sprintf("%s:%d", this.Host, this.Port)
 		// TODO Convert to glog
-		//log.Printf("Dialing %s...", server)
+		log.Printf("Dialing %s...", server)
 		if this.net_DialTimeout == nil {
 			this.net_DialTimeout = net.DialTimeout
 		}
-		l, err := this.net_DialTimeout("tcp", server, this.Timeout)
+		if this.tls_DialTimeout == nil {
+			this.tls_DialTimeout = func(network string, addr string, timeout time.Duration, tlsc *tls.Config) (net.Conn, error) {
+				dialer := &net.Dialer{ Timeout: timeout }
+				return tls.DialWithDialer(dialer, network, addr, tlsc)
+			}
+		}
+		var l    net.Conn
+		var err  error
+		if this.Smtps {
+			var tlsc tls.Config
+			if this.TLSClientConfig != nil { tlsc = *this.TLSClientConfig }
+			l, err = this.tls_DialTimeout("tcp", server, this.Timeout, &tlsc)
+		} else {
+			l, err = this.net_DialTimeout("tcp", server, this.Timeout)
+		}
 		if err != nil {
 			// TODO Convert to glog
-			//log.Printf("Error dialing %s: %v", server, err)
+			log.Printf("Error dialing %s: %v", server, err)
 			this.ftime = now
 			ctl <- &connResp{nil, err}
 			return
@@ -241,10 +258,10 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		if err = c.Hello(hostname); err != nil {
 			c.Quit(); ctl <- &connResp{nil, err}; return
 		}
-		if this.TLSClientConfig != nil {
+		if this.TLSClientConfig != nil && !this.Smtps {
 			tlsc := *this.TLSClientConfig
 			// TODO Convert to glog
-			//log.Printf("Starting TLS on %s...", server)
+			log.Printf("Starting TLS on %s...", server)
 			if err = c.StartTLS(&tlsc); err != nil {
 				this.ftime = now
 				c.Quit(); ctl <- &connResp{nil, err}; return
@@ -252,7 +269,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		}
 		if auth != nil {
 			// TODO Convert to glog
-			//log.Printf("Authenticating with %s...", server)
+			log.Printf("Authenticating with %s...", server)
 			if err = c.Auth(auth); err != nil {
 				c.Quit(); ctl <- &connResp{nil, err}; return
 			}
