@@ -7,10 +7,10 @@ import (
 )
 
 type Message struct {
-	From       mail.Address
-	To       []mail.Address
-	Header     mail.Header
-	Body     []byte
+	From   mail.Address
+	To     []mail.Address
+	Header mail.Header
+	Body   []byte
 }
 
 func (this *Message) smtpFrom() string {

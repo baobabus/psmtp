@@ -3,13 +3,13 @@
 package psmtp
 
 import (
-	"net/smtp"
 	"container/heap"
+	"net/smtp"
 )
 
 type cqItem struct {
 	conn  *psmtpConn
-	index  int
+	index int
 }
 
 type _cQueue []*cqItem
@@ -22,9 +22,9 @@ type cPool struct {
 
 func newCPool(capacity int) *cPool {
 	result := &cPool{
-		capacity:   capacity,
-		all:        make(_cQueue, 0, capacity),
-		byAuth:     make(map[smtp.Auth]_cQueue, 0),
+		capacity: capacity,
+		all:      make(_cQueue, 0, capacity),
+		byAuth:   make(map[smtp.Auth]_cQueue, 0),
 	}
 	heap.Init(&result.all)
 	return result
@@ -39,7 +39,7 @@ func (this *cPool) Push(conn *psmtpConn) []*psmtpConn {
 	if this.capacity > 0 {
 		for {
 			if this.all.Len() < this.capacity {
-				break;
+				break
 			}
 			if v, ok := this.PopAny(); ok {
 				result = append(result, v)
@@ -86,7 +86,7 @@ func (this *cPool) PopAny() (*psmtpConn, bool) {
 	return result.conn, true
 }
 
-// PopAny pops least recently used connection 
+// PopAny pops least recently used connection
 // with given auth and correctly updates global queue.
 // Returns ok = false if no matching connection is available.
 func (this *cPool) Pop(auth smtp.Auth) (*psmtpConn, bool) {

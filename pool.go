@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Interface extracted from smtp.Client to 
+// Interface extracted from smtp.Client to
 // aid with plugging in alternative implementations
 // and unit testing harnesses.
 type smtpClient interface {
@@ -32,38 +32,38 @@ type smtpClient interface {
 }
 
 type psmtpConn struct {
-	client   smtpClient
-	ok       bool
-	auth     smtp.Auth
-	ctime    time.Time
-	atime    time.Time
+	client smtpClient
+	ok     bool
+	auth   smtp.Auth
+	ctime  time.Time
+	atime  time.Time
 }
 
 type connResp struct {
-	conn  *psmtpConn
-	err    error
+	conn *psmtpConn
+	err  error
 }
 
 type Pool struct {
-	Smtps              bool
-	Host               string
-	Port               uint16
-	TLSClientConfig   *tls.Config
-	MaxConns           int
-	MaxIdleConns       int
-	MaxLiveTime        time.Duration
-	MaxIdleTime        time.Duration
-	MinWaitTime        time.Duration
-	Timeout            time.Duration
+	Smtps           bool
+	Host            string
+	Port            uint16
+	TLSClientConfig *tls.Config
+	MaxConns        int
+	MaxIdleConns    int
+	MaxLiveTime     time.Duration
+	MaxIdleTime     time.Duration
+	MinWaitTime     time.Duration
+	Timeout         time.Duration
 
-	ftime              time.Time
+	ftime time.Time
 
-	cmx                sync.Mutex
-	cpool             *cPool
-	ccnt               int
-	cntfy              chan *connResp
+	cmx   sync.Mutex
+	cpool *cPool
+	ccnt  int
+	cntfy chan *connResp
 
-	clsd               bool
+	clsd bool
 
 	net_DialTimeout    func(string, string, time.Duration) (net.Conn, error)
 	tls_DialTimeout    func(string, string, time.Duration, *tls.Config) (net.Conn, error)
@@ -93,7 +93,9 @@ func (this *Pool) Close() error {
 // becomes available.
 func (this *Pool) GetMailer(auth smtp.Auth) (*Mailer, error) {
 	for {
-		if this.clsd { return nil, errors.New("Pool is closed"); }
+		if this.clsd {
+			return nil, errors.New("Pool is closed")
+		}
 		result, ctl, err := this.tryMailer(auth)
 		if err != nil {
 			return nil, err
@@ -106,7 +108,7 @@ func (this *Pool) GetMailer(auth smtp.Auth) (*Mailer, error) {
 		}
 		// TODO Implement this with unbuffered channel
 		// TODO Add arbitration based on returned connection properties
-		<- ctl
+		<-ctl
 	}
 }
 
@@ -168,7 +170,7 @@ func (this *Pool) tryMailer(auth smtp.Auth) (*Mailer, <-chan *connResp, error) {
 			// Not en error. We just can't provide anything at the moment.
 			// Return a channel for notifying when a connection becomes
 			// available or when dialing becomes possible.
-			return nil, this.notifyCh() , nil
+			return nil, this.notifyCh(), nil
 		}
 		this.checkExp(conn)
 		if conn.ok {
@@ -178,7 +180,7 @@ func (this *Pool) tryMailer(auth smtp.Auth) (*Mailer, <-chan *connResp, error) {
 			this.closeConn(conn)
 		}
 		// Dialing may become possible once the connection closing is complete
-		return nil, this.notifyCh() , nil
+		return nil, this.notifyCh(), nil
 		// // Try dialing in place of popped connection
 		// result, err := this.dial(auth)
 		// if err != nil {
@@ -222,15 +224,17 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		}
 		if this.tls_DialTimeout == nil {
 			this.tls_DialTimeout = func(network string, addr string, timeout time.Duration, tlsc *tls.Config) (net.Conn, error) {
-				dialer := &net.Dialer{ Timeout: timeout }
+				dialer := &net.Dialer{Timeout: timeout}
 				return tls.DialWithDialer(dialer, network, addr, tlsc)
 			}
 		}
-		var l    net.Conn
-		var err  error
+		var l net.Conn
+		var err error
 		if this.Smtps {
 			var tlsc tls.Config
-			if this.TLSClientConfig != nil { tlsc = *this.TLSClientConfig }
+			if this.TLSClientConfig != nil {
+				tlsc = *this.TLSClientConfig
+			}
 			l, err = this.tls_DialTimeout("tcp", server, this.Timeout, &tlsc)
 		} else {
 			l, err = this.net_DialTimeout("tcp", server, this.Timeout)
@@ -255,7 +259,9 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		}
 		hostname, _ := os.Hostname()
 		if err = c.Hello(hostname); err != nil {
-			c.Quit(); ctl <- &connResp{nil, err}; return
+			c.Quit()
+			ctl <- &connResp{nil, err}
+			return
 		}
 		if this.TLSClientConfig != nil && !this.Smtps {
 			tlsc := *this.TLSClientConfig
@@ -263,14 +269,18 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 			//log.Printf("Starting TLS on %s...", server)
 			if err = c.StartTLS(&tlsc); err != nil {
 				this.ftime = now
-				c.Quit(); ctl <- &connResp{nil, err}; return
+				c.Quit()
+				ctl <- &connResp{nil, err}
+				return
 			}
 		}
 		if auth != nil {
 			// TODO Convert to glog
 			//log.Printf("Authenticating with %s...", server)
 			if err = c.Auth(auth); err != nil {
-				c.Quit(); ctl <- &connResp{nil, err}; return
+				c.Quit()
+				ctl <- &connResp{nil, err}
+				return
 			}
 		}
 		ctl <- &connResp{
@@ -286,7 +296,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 	}(ctl)
 	return &Mailer{
 		conn: nil,
-		ctl: ctl,
+		ctl:  ctl,
 		pool: this,
 	}, nil
 }
