@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/smtp"
 	"os"
@@ -217,7 +216,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		defer close(ctl)
 		server := fmt.Sprintf("%s:%d", this.Host, this.Port)
 		// TODO Convert to glog
-		log.Printf("Dialing %s...", server)
+		//log.Printf("Dialing %s...", server)
 		if this.net_DialTimeout == nil {
 			this.net_DialTimeout = net.DialTimeout
 		}
@@ -238,7 +237,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		}
 		if err != nil {
 			// TODO Convert to glog
-			log.Printf("Error dialing %s: %v", server, err)
+			//log.Printf("Error dialing %s: %v", server, err)
 			this.ftime = now
 			ctl <- &connResp{nil, err}
 			return
@@ -261,7 +260,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		if this.TLSClientConfig != nil && !this.Smtps {
 			tlsc := *this.TLSClientConfig
 			// TODO Convert to glog
-			log.Printf("Starting TLS on %s...", server)
+			//log.Printf("Starting TLS on %s...", server)
 			if err = c.StartTLS(&tlsc); err != nil {
 				this.ftime = now
 				c.Quit(); ctl <- &connResp{nil, err}; return
@@ -269,7 +268,7 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 		}
 		if auth != nil {
 			// TODO Convert to glog
-			log.Printf("Authenticating with %s...", server)
+			//log.Printf("Authenticating with %s...", server)
 			if err = c.Auth(auth); err != nil {
 				c.Quit(); ctl <- &connResp{nil, err}; return
 			}
