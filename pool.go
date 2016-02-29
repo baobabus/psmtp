@@ -139,10 +139,10 @@ func (this *Pool) putMailer(mailer *Mailer) {
 			//log.Printf("Pool.putMailer(): returned mailer with no connection: %v.\n", conn)
 		}
 		// TODO Deal with mailers for which connection attempts are still pending
-		// this.ccnt--
-		// if !this.clsd {
-		// 	this.notifyCh() <- nil
-		// }
+		this.ccnt--
+		if !this.clsd {
+			this.notifyCh() <- nil
+		}
 	}
 }
 
@@ -194,7 +194,7 @@ func (this *Pool) tryMailer(auth smtp.Auth) (*Mailer, <-chan *connResp, error) {
 func (this *Pool) notifyCh() chan *connResp {
 	if !this.clsd && this.cntfy == nil {
 		// TODO Make buffer size configurable
-		this.cntfy = make(chan *connResp, 100)
+		this.cntfy = make(chan *connResp, 2)
 	}
 	return this.cntfy
 }
