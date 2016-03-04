@@ -95,7 +95,7 @@ func (this *Mailer) Close() error {
 		return errors.New("closed")
 	}
 	// TODO Make waiting for connection and closing asynchronous
-	this.waitForConn()
+	err := this.waitForConn()
 	if this.pool == nil {
 		return errors.New("closing mailer with no pool")
 	}
@@ -104,7 +104,7 @@ func (this *Mailer) Close() error {
 	this.ctl = nil
 	this.pool = nil
 	this.clsd = true
-	return nil
+	return err
 }
 
 func (this *Mailer) waitForConn() error {

@@ -6,83 +6,42 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/smtp"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/baobabus/slog"
 )
 
-// Interface extracted from smtp.Client to
-// aid with plugging in alternative implementations
-// and unit testing harnesses.
-type smtpClient interface {
-	Auth(a smtp.Auth) error
-	Close() error
-	Data() (io.WriteCloser, error)
-	Extension(ext string) (bool, string)
-	Hello(localName string) error
-	Mail(from string) error
-	Quit() error
-	Rcpt(to string) error
-	Reset() error
-	StartTLS(config *tls.Config) error
-	Verify(addr string) error
-}
-
-type psmtpConn struct {
-	client smtpClient
-	ok     bool
-	auth   smtp.Auth
-	ctime  time.Time
-	atime  time.Time
-}
-
-type connResp struct {
-	conn *psmtpConn
-	err  error
-}
-
 type Pool struct {
-	Smtps           bool
-	Host            string
-	Port            uint16
-	TLSClientConfig *tls.Config
-	MaxConns        int
-	MaxIdleConns    int
-	MaxLiveTime     time.Duration
-	MaxIdleTime     time.Duration
-	MinWaitTime     time.Duration
-	Timeout         time.Duration
-
-	ftime time.Time
-
-	cmx   sync.Mutex
-	cpool *cPool
-	ccnt  int
-	cntfy chan *connResp
-
-	clsd bool
-
+	Config
+	cc                 *sync.Cond
+	cpool              *cPool
+	clsd               bool
+	ftime              time.Time
+	ccnt               int
 	net_DialTimeout    func(string, string, time.Duration) (net.Conn, error)
 	tls_DialTimeout    func(string, string, time.Duration, *tls.Config) (net.Conn, error)
 	net_smtp_NewClient func(net.Conn, string) (smtpClient, error)
 }
 
+func NewPool(cfg Config) (*Pool, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &Pool{Config: cfg, cc: sync.NewCond(&sync.Mutex{}), cpool: newCPool(cfg.MaxIdleConns)}, nil
+}
+
 func (this *Pool) Close() error {
-	this.cmx.Lock()
-	defer this.cmx.Unlock()
+	this.cc.L.Lock()
+	defer this.cc.L.Unlock()
 	if !this.clsd {
-		// TODO Prevent new mailer check-outs
-		// TODO Close all idle connections
-		// TODO Close connections from all returned mailers
-		if this.cntfy != nil {
-			close(this.cntfy)
-			this.cntfy = nil
-		}
+		this.closeIdle()
 		this.clsd = true
 	}
+	this.cc.Broadcast()
 	return nil
 }
 
@@ -91,131 +50,89 @@ func (this *Pool) Close() error {
 // in progress.
 // If the pool is exhausted, the method blocks until a connection
 // becomes available.
-func (this *Pool) GetMailer(auth smtp.Auth) (*Mailer, error) {
+func (this *Pool) GetMailer(auth smtp.Auth) (res *Mailer, err error) {
+	slog.Trace(1).Printe("Getting mailer", "auth", auth)
+	this.cc.L.Lock()
 	for {
 		if this.clsd {
-			return nil, errors.New("Pool is closed")
+			err = errors.New("cannot check out from closed pool")
+			break
 		}
-		result, ctl, err := this.tryMailer(auth)
-		if err != nil {
-			return nil, err
+		slog.Trace(2).Printe("Trying pool", "auth", auth, "cnt", this.ccnt)
+		if conn, ok := this.popMailer(auth); ok {
+			res, err = this.newMailer(conn, auth)
+			break
 		}
-		if result != nil {
-			return result, nil
+		slog.Trace(2).Printe("Trying new", "auth", auth, "cnt", this.ccnt)
+		if this.MaxConns == 0 || this.ccnt < this.MaxConns {
+			res, err = this.newMailer(nil, auth)
+			break
 		}
-		if ctl == nil {
-			panic("No control channel")
+		slog.Trace(2).Printe("Trying any", "auth", auth, "cnt", this.ccnt)
+		if conn, ok := this.popMailer(nil); ok {
+			res, err = this.newMailer(conn, auth)
+			break
 		}
-		// TODO Implement this with unbuffered channel
-		// TODO Add arbitration based on returned connection properties
-		<-ctl
+		slog.Trace(2).Printe("Waiting", "auth", auth, "cnt", this.ccnt)
+		this.cc.Wait()
 	}
-}
-
-// Puts Mailer back in the pool.
-func (this *Pool) putMailer(mailer *Mailer) {
-	this.cmx.Lock()
-	defer this.cmx.Unlock()
-	conn := mailer.conn
-	this.checkExp(conn)
-	if !this.clsd && conn != nil && conn.ok {
-		// return to idle pool
-		overflow := this.cpool.Push(conn)
-		// this should be empty or only have one item,
-		// unless pool resizing took place for some reason
-		for _, v := range overflow {
-			// TODO implement connection wait queue
-			// and return a connection instead of closing it
-			// if there are waiters
-			this.closeConn(v)
-		}
-		// This may have been returned in overflow and closed if maxIdleConns is 0
-		if conn.ok {
-			this.notifyCh() <- &connResp{conn, nil}
-		}
+	this.cc.L.Unlock()
+	if err != nil {
+		slog.On(err).Trace(1).Prints("Getting mailer", "auth", auth)
 	} else {
-		if conn == nil {
-			// TODO Convert to glog
-			//log.Printf("Pool.putMailer(): returned mailer with no connection: %v.\n", conn)
-		}
-		// TODO Deal with mailers for which connection attempts are still pending
-		this.ccnt--
-		if !this.clsd {
-			this.notifyCh() <- nil
-		}
+		slog.Success().Trace(1).Prints("Getting mailer", "auth", auth)
 	}
+	return
 }
 
-func (this *Pool) tryMailer(auth smtp.Auth) (*Mailer, <-chan *connResp, error) {
-	this.cmx.Lock()
-	defer this.cmx.Unlock()
-	// Try idle pool
-	if !this.clsd && this.cpool == nil {
-		this.cpool = newCPool(this.MaxIdleConns)
-	}
-	if conn, ok := this.cpool.Pop(auth); ok {
-		return &Mailer{conn: conn, ctl: nil, pool: this}, nil, nil // TODO add ctl channel
-	}
-	if this.MaxConns == 0 || this.ccnt < this.MaxConns {
-		// Try dialing
-		result, err := this.dial(auth)
-		if err == nil {
-			this.ccnt++
+func (this *Pool) popMailer(auth smtp.Auth) (res *psmtpConn, ok bool) {
+	res = nil
+	ok = true
+	for res == nil && ok {
+		if auth != nil {
+			res, ok = this.cpool.Pop(auth)
+		} else {
+			res, ok = this.cpool.PopAny()
 		}
-		return result, nil, err
-	} else {
-		// Try closing idle connection and re-dialing
-		conn, ok := this.cpool.PopAny()
-		if !ok {
-			// Not en error. We just can't provide anything at the moment.
-			// Return a channel for notifying when a connection becomes
-			// available or when dialing becomes possible.
-			return nil, this.notifyCh(), nil
+		if ok {
+			res = this.closeConnIfExp(res)
 		}
-		this.checkExp(conn)
-		if conn.ok {
-			if conn.auth == auth {
-				return &Mailer{conn: conn, ctl: nil, pool: this}, nil, nil
-			}
-			this.closeConn(conn)
-		}
-		// Dialing may become possible once the connection closing is complete
-		return nil, this.notifyCh(), nil
-		// // Try dialing in place of popped connection
-		// result, err := this.dial(auth)
-		// if err != nil {
-		// 	this.ccnt--
-		// }
-		// return result, nil, err
 	}
+	return
 }
 
-// Caller must hold cmx lock
-func (this *Pool) notifyCh() chan *connResp {
-	if !this.clsd && this.cntfy == nil {
-		// TODO Make buffer size configurable
-		this.cntfy = make(chan *connResp, 2)
+func (this *Pool) newMailer(conn *psmtpConn, auth smtp.Auth) (*Mailer, error) {
+	if conn != nil && conn.auth == auth {
+		return &Mailer{conn: conn, ctl: nil, pool: this}, nil
 	}
-	return this.cntfy
-}
-
-// Caller must hold cmx lock
-func (this *Pool) checkExp(conn *psmtpConn) {
-	now := time.Now()
-	if conn != nil && conn.ok && conn.ctime.Add(this.MaxLiveTime).Before(now) {
-		this.closeConn(conn)
-	}
-}
-
-// Caller must hold cmx lock
-func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 	now := time.Now()
 	if now.Sub(this.ftime) < this.MinWaitTime {
 		return nil, errors.New("connect blackout period")
 	}
+	if conn == nil {
+		slog.Trace(3).Printe("Incrementing for new", "cnt", this.ccnt)
+		this.ccnt++
+		slog.Success().Trace(3).Prints("Incrementing for new", "cnt", this.ccnt)
+	}
 	ctl := make(chan *connResp, 1)
 	go func(ctl chan<- *connResp) {
 		defer close(ctl)
+		ok := false
+		defer func() {
+			if !ok {
+				this.cc.L.Lock()
+				slog.Trace(3).Printe("Decrementing on failure", "cnt", this.ccnt)
+				this.ccnt--
+				slog.Success().Trace(3).Prints("Decrementing on failure", "cnt", this.ccnt)
+				this.cc.L.Unlock()
+				this.cc.Signal()
+			}
+		}()
+		if conn != nil && conn.client != nil {
+			// TODO Convert to glog
+			//log.Printf("Closing old connection")
+			conn.client.Quit()
+		}
 		server := fmt.Sprintf("%s:%d", this.Host, this.Port)
 		// TODO Convert to glog
 		//log.Printf("Dialing %s...", server)
@@ -283,12 +200,14 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 				return
 			}
 		}
+		ok = true
 		ctl <- &connResp{
 			conn: &psmtpConn{
 				client: c,
 				ok:     true,
 				auth:   auth,
 				ctime:  now,
+				etime:  now.Add(this.MaxLiveTime),
 				atime:  now,
 			},
 			err: nil,
@@ -301,24 +220,88 @@ func (this *Pool) dial(auth smtp.Auth) (*Mailer, error) {
 	}, nil
 }
 
-// Caller must hold cmx lock
-func (this *Pool) closeConn(conn *psmtpConn) {
-	if conn.ok {
-		// TODO Convert to glog
-		//log.Printf("%p Pool.closeConn()", this)
-		conn.ok = false
-		if conn.client != nil {
-			go func(c smtpClient, p *Pool) {
-				c.Quit()
-				p.cmx.Lock()
-				defer p.cmx.Unlock()
-				p.ccnt--
-				p.notifyCh() <- nil
-			}(conn.client, this)
-		} else {
-			// TODO Convert to glog
-			//log.Printf("psmtpConn.close(): No client to close.")
-			this.ccnt--
+// Puts Mailer back in the pool.
+func (this *Pool) putMailer(mailer *Mailer) {
+	slog.Trace(1).Printe("Putting mailer", "mailer", mailer)
+	this.cc.L.Lock()
+	defer this.cc.L.Unlock()
+	conn := mailer.conn
+	if conn != nil {
+		conn = this.closeConnIfExp(conn)
+	}
+	if !this.clsd && conn != nil {
+		// return to idle pool
+		overflow := this.cpool.Push(conn)
+		// this should be empty or only have one item,
+		// unless pool resizing took place for some reason
+		for _, v := range overflow {
+			// TODO implement connection wait queue
+			// and return a connection instead of closing it
+			// if there are waiters
+			this.closeConn(v)
+		}
+		if len(overflow) == 0 {
+			this.cc.Signal()
 		}
 	}
+	slog.Success().Trace(1).Prints("Putting mailer", "mailer", mailer)
+}
+
+func (this *Pool) closeIdle() {
+	for {
+		res, ok := this.cpool.PopAny()
+		if !ok {
+			break
+		}
+		this.closeConnQuiet(res)
+	}
+}
+
+func (this *Pool) closeConnIfExp(conn *psmtpConn) *psmtpConn {
+	slog.Trace(3).Printe("Checking connection", "conn", conn)
+	now := time.Now()
+	if !conn.ok || conn.etime.Before(now) {
+		slog.With(errors.New("expired")).Trace(3).Prints("Checking connection", "conn", conn)
+		this.closeConn(conn)
+		return nil
+	}
+	slog.Success().Trace(3).Prints("Checking connection", "conn", conn)
+	return conn
+}
+
+func (this *Pool) closeConn(conn *psmtpConn) {
+	if conn.ok {
+		conn.ok = false
+		if conn.client != nil {
+			go func(c *psmtpConn, p *Pool) {
+				c.client.Quit()
+				p.cc.L.Lock()
+				slog.Trace(3).Printe("Async closing connection", "conn", conn, "cnt", p.ccnt)
+				p.ccnt--
+				slog.Success().Trace(3).Prints("Async closing connection", "conn", conn, "cnt", p.ccnt)
+				p.cc.L.Unlock()
+				p.cc.Signal()
+			}(conn, this)
+			return
+		}
+	}
+	slog.Trace(3).Printe("Closing connection", "conn", conn, "cnt", this.ccnt)
+	this.ccnt--
+	slog.Success().Trace(3).Prints("Closing connection", "conn", conn, "cnt", this.ccnt)
+	this.cc.Signal()
+}
+
+func (this *Pool) closeConnQuiet(conn *psmtpConn) {
+	if conn.ok {
+		conn.ok = false
+		if conn.client != nil {
+			go conn.client.Quit()
+		}
+	}
+	this.ccnt--
+}
+
+type connResp struct {
+	conn *psmtpConn
+	err  error
 }
